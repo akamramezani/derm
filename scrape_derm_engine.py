@@ -11,9 +11,15 @@ Run:
     python scrape_derm_engine.py <url> --out out  # any other page
 
 Writes:
-    out/site/            offline copy: the HTML plus every file it loaded (JS, CSS, fonts, JSON, images)
+    out/site/            offline copy: the HTML plus every file it loaded (JS, CSS, fonts, JSON, images),
+                         the knowledge-API answers for ALL presentations, and offline-shim.js
     out/data/            each dataset found, one JSON file per dataset
     out/manifest.json    what was saved, where each dataset came from, and what could NOT be resolved
+
+This engine loads one presentation per pick from a knowledge API and sends the entered findings to the
+server to be scored. The script asks the page itself to load every presentation, and offline-shim.js
+answers those API calls from the saved files. Scoring (POST .../assess) needs the server's engine
+(derm_engine.js): until that is installed, the page shows its own "Not connected" banner instead of a ranking.
 
 The page is opened in a real browser, so data that is inline, in a separate .js/.json file, or fetched
 at runtime is all captured. Read manifest.json["caveats"] before trusting the copy.
@@ -28,7 +34,7 @@ import shutil
 from datetime import datetime, timezone
 from html import unescape
 from pathlib import Path
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 from playwright.sync_api import sync_playwright
 
@@ -59,6 +65,61 @@ REF = re.compile(
 CSS_URL = re.compile(r"""url\(\s*['"]?([^'")\s]+)['"]?\s*\)""", re.I)
 # data declared as: const X = {..} | let X = [..] | var X = .. | window.X = ..
 DECL = re.compile(r"(?<![\w$.])(?:(?:window|globalThis)\.|(?:const|let|var)\s+)([A-Za-z_$][\w$]*)\s*=\s*(?=[\[{])")
+IGNORE_VARS = {"DERM"}  # the page's runtime cache of API replies (bootstrap + the last presentation loaded)
+
+# Injected as the first script of the offline page. It answers the page's calls to /api/knowledge/derm/...
+# from the files saved in the mirror, whatever host the page believes the API is on.
+SHIM_JS = r"""/* offline-shim.js - answers the page's knowledge-API calls from files saved next to the page */
+(function () {
+  "use strict";
+  var PREFIX = "/api/knowledge/derm";
+  var LOCAL = "__LOCAL__";            /* where the scraper saved the API replies */
+  var realFetch = window.fetch.bind(window);
+  var cache = {};
+  function json(obj, status) {
+    return new Response(JSON.stringify(obj), { status: status || 200, headers: { "Content-Type": "application/json" } });
+  }
+  function load(path) {
+    if (!cache[path]) {
+      cache[path] = realFetch(LOCAL + path + ".json", { cache: "no-store" }).then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      }).catch(function (e) { delete cache[path]; throw e; });
+    }
+    return cache[path];
+  }
+  window.fetch = function (input, init) {
+    var raw = typeof input === "string" ? input : (input && input.url) || String(input);
+    var u;
+    try { u = new URL(raw, location.href); } catch (e) { return realFetch(input, init); }
+    if (u.pathname.indexOf(PREFIX) !== 0) return realFetch(input, init);
+    var path = u.pathname.slice(PREFIX.length);                      /* /bootstrap, /presentation/<id>, /assess */
+    var method = String((init && init.method) || (input && input.method) || "GET").toUpperCase();
+    if (method === "GET") {
+      return load(path).then(function (d) { return json(d); },
+                             function () { return json({ error: "not available offline" }, 404); });
+    }
+    if (method === "POST" && path === "/assess") {
+      /* WIRE-UP POINT: scoring runs on the server (derm_engine.js). Until that engine is installed here as
+         window.DERM_ASSESS(presentation, ctx, bootstrap) -> response, answer 503 so the page says "Not connected". */
+      if (typeof window.DERM_ASSESS !== "function") return Promise.resolve(json({ error: "offline scoring engine not installed" }, 503));
+      var ctx;
+      try { ctx = (JSON.parse(init.body) || {}).ctx || {}; } catch (e) { return Promise.resolve(json({ error: "bad request" }, 400)); }
+      return Promise.all([load("/presentation/" + encodeURIComponent(ctx.presId)), load("/bootstrap")])
+        .then(function (a) { return window.DERM_ASSESS(a[0], ctx, a[1]); })
+        .then(function (R) {
+          if (init.signal && init.signal.aborted) throw new DOMException("Aborted", "AbortError");
+          return json(R);
+        }, function (e) {
+          if (e && e.name === "AbortError") throw e;
+          return json({ error: String(e) }, 500);
+        });
+    }
+    return Promise.resolve(json({ error: "not available offline" }, 404));
+  };
+})();
+"""
+
 # fetch(x) / import(x) where x is not a plain string literal -> cannot be resolved statically
 DYNAMIC = re.compile(r"\b(?:fetch|import)\(\s*(?![\"'])([^)]{1,80})\)")
 
@@ -91,7 +152,7 @@ def local_path(url: str, ctype: str, base_key: str) -> str:
         stem += "__" + hashlib.md5(p.query.encode()).hexdigest()[:8]
     rel = f"{folder}/{stem}{'.' + ext if ext else ''}".lstrip("/")
     if not same:
-        rel = f"_ext/{p.netloc}/{rel}"
+        rel = f"external/{p.netloc}/{rel}"  # not "_ext": Android's build silently drops asset folders starting with "_"
     return re.sub(r'[<>:"|?*]', "_", rel)
 
 
@@ -140,6 +201,38 @@ def shape(v) -> str:
         keys = list(v)
         return "object{" + ", ".join(map(str, keys[:12])) + (", ..." if len(keys) > 12 else "") + "}"
     return type(v).__name__
+
+
+def load_all_presentations(page, captured: dict, caveats: list) -> list:
+    """This engine fetches ONE presentation per pick. Ask the page itself to load every one listed in its
+    index, so the requests are exactly the ones the page makes. Retries with back-off (the API rate-limits)."""
+    ids = page.evaluate("typeof INDEX !== 'undefined' && Array.isArray(INDEX) ? INDEX.map(p => p.id) : []")
+    if not ids or not page.evaluate("typeof loadPresentation === 'function'"):
+        caveats.append("INDEX / loadPresentation() not found on the page: only the default presentation was captured.")
+        return []
+
+    def have(i: str) -> bool:
+        return any(urlparse(u).path.endswith("/presentation/" + quote(i, safe="")) for u in captured)
+
+    errors: dict[str, str] = {}
+    missing = [i for i in ids if not have(i)]
+    for attempt in range(4):
+        for i in list(missing):
+            try:
+                page.evaluate("(id) => loadPresentation(id)", i)
+            except Exception as e:  # e.g. HTTP 429
+                errors[i] = str(e).splitlines()[0][:100]
+            page.wait_for_timeout(300)  # let the response handler store the body
+            if have(i):
+                missing.remove(i)
+            page.wait_for_timeout(700)
+        if not missing:
+            break
+        page.wait_for_timeout(5000 * (attempt + 1))
+    for i in missing:
+        caveats.append(f"Presentation '{i}' could not be fetched ({errors.get(i, 'no response captured')}): "
+                       "it is NOT in the offline copy.")
+    return ids
 
 
 def main() -> None:
@@ -201,6 +294,7 @@ def main() -> None:
         page.wait_for_timeout(1500)
         page_url = main_resp.url.split("#")[0]
         captured.setdefault(page_url, ("text/html", main_resp.body()))
+        pres_ids = load_all_presentations(page, captured, caveats)
 
         # ---- 1. files that same-site code refers to but that did not load during the visit (lazy data, hover images)
         failed: set[str] = set()
@@ -209,7 +303,8 @@ def main() -> None:
         for _ in range(3):
             new: dict[str, tuple[str, bytes]] = {}
             for url, (ct, body) in list(captured.items()):
-                if origin_key(url) != base_key or not looks_textual(url, ct):
+                is_css = urlparse(url).path.endswith(".css") or ct.startswith("text/css")
+                if not looks_textual(url, ct) or not (origin_key(url) == base_key or is_css):
                     continue
                 text = body.decode("utf-8", "ignore")
                 base = url if urlparse(url).path.endswith(".css") else page_url
@@ -219,9 +314,9 @@ def main() -> None:
                     cand = urljoin(base, unescape(ref)).split("#")[0]
                     if cand in captured or cand in new or cand in failed:
                         continue
-                    if origin_key(cand) != base_key:
+                    if origin_key(cand) != base_key and not is_css:  # code on another host is not followed ...
                         other_hosts.add(cand)
-                        continue
+                        continue                                       # ... but everything a stylesheet lists is
                     if budget <= 0:
                         continue
                     budget -= 1
@@ -235,6 +330,8 @@ def main() -> None:
                             failed.add(cand)
                     except Exception:
                         failed.add(cand)
+                    if cand in failed and origin_key(cand) != base_key:
+                        caveats.append(f"Listed by a stylesheet but could not be fetched: {cand}")
             if not new:
                 break
             captured.update(new)
@@ -276,6 +373,8 @@ def main() -> None:
                 if not lit or len(lit) < 20:
                     continue
                 name = m.group(1)
+                if name in IGNORE_VARS:
+                    continue
                 # the page's own value (resolves spreads, computed fields, function calls) ...
                 if name not in runtime_cache:  # one lookup per variable name, however often it is declared
                     runtime_cache[name] = page.evaluate(
@@ -300,7 +399,9 @@ def main() -> None:
                 except Exception:
                     caveats.append(f"{url}: JSON response could not be parsed.")
                     continue
-                add_dataset(Path(unquote(urlparse(url).path)).stem or "response", val, "network response", url)
+                parts = [x for x in unquote(urlparse(url).path).split("/") if x]
+                parts[-1] = Path(parts[-1]).stem if parts else "response"
+                add_dataset("_".join(parts[-2:]) or "response", val, "network response", url)
 
         blank = ctx.new_page()
         blank.goto("about:blank")
@@ -319,7 +420,7 @@ def main() -> None:
 
         browser.close()
 
-    # ---- 4. write the offline mirror; cross-site URLs are repointed at /_ext/<host>/..., root-relative
+    # ---- 4. write the offline mirror; cross-site URLs are repointed at /external/<host>/..., root-relative
     paths = {u: local_path(u, ct, base_key) for u, (ct, _) in captured.items()}
     repl: dict[str, str] = {}
     for u, rel in paths.items():
@@ -344,6 +445,19 @@ def main() -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(body)
         mirrored.append({"url": u, "file": f"site/{rel}", "bytes": len(body)})
+    api_dir = next(("/" + rel.rsplit("/", 1)[0] for u, rel in paths.items()
+                    if urlparse(u).path.endswith("/api/knowledge/derm/bootstrap")), None)
+    if api_dir:
+        (out / "site" / "offline-shim.js").write_text(SHIM_JS.replace("__LOCAL__", api_dir), encoding="utf-8")
+        main_file = out / "site" / paths[page_url]
+        html_text, n = re.subn(r"(<head[^>]*>)", r'\1<script src="offline-shim.js"></script>',
+                               main_file.read_text(encoding="utf-8"), count=1, flags=re.I)
+        if n:
+            main_file.write_text(html_text, encoding="utf-8")
+        else:
+            caveats.append("No <head> tag found: offline-shim.js was written but NOT linked into the page.")
+    else:
+        caveats.append("No knowledge-API calls were captured: offline-shim.js was not created.")
     if paths[page_url] != "index.html":
         shutil.copyfile(out / "site" / paths[page_url], out / "site" / "index.html")
 
@@ -357,6 +471,8 @@ def main() -> None:
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print(f"Mirrored {len(mirrored)} files -> {out / 'site'}  (entry: {paths[page_url]}, also index.html)")
+    print(f"Presentations on the page's index: {len(pres_ids)}; API replies mirrored: "
+          f"{sum(1 for u in captured if '/api/knowledge/derm/presentation/' in u)}")
     print(f"Datasets found: {len(datasets)} -> {out / 'data'}")
     for d in datasets:
         print(f"  {d['file']:<40} {d['chars']:>9,} chars  {d['shape'][:60]}  [{d['found_by']}]")

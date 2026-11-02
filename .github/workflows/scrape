@@ -1,0 +1,26 @@
+# Save as .github/workflows/scrape.yml  (the script goes in the repo root)
+# Run it from the repo's Actions tab -> "Mirror derm engine" -> Run workflow, then download the "derm-offline" artifact.
+name: Mirror derm engine
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Page to mirror
+        default: https://medconsults.ai/dermatology-differential-engine.html
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install playwright json5 && playwright install --with-deps chromium
+      - name: Scrape
+        env:
+          URL: ${{ inputs.url }}
+        run: python scrape_derm_engine.py "$URL" --out out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: derm-offline
+          path: out
